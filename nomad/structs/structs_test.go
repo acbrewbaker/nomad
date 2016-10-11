@@ -115,9 +115,9 @@ func testJob() *Job {
 		},
 		TaskGroups: []*TaskGroup{
 			&TaskGroup{
-				Name:      "web",
-				Count:     10,
-				LocalDisk: DefaultLocalDisk(),
+				Name:          "web",
+				Count:         10,
+				EphemeralDisk: DefaultEphemeralDisk(),
 				RestartPolicy: &RestartPolicy{
 					Mode:     RestartPolicyModeFail,
 					Attempts: 3,
@@ -345,7 +345,7 @@ func TestTaskGroup_Validate(t *testing.T) {
 
 	err = tg.Validate()
 	mErr = err.(*multierror.Error)
-	if !strings.Contains(mErr.Errors[0].Error(), "should have a local disk object") {
+	if !strings.Contains(mErr.Errors[0].Error(), "should have an ephemeral disk object") {
 		t.Fatalf("err: %s", err)
 	}
 	if !strings.Contains(mErr.Errors[1].Error(), "2 redefines 'web' from task 1") {
@@ -361,8 +361,8 @@ func TestTaskGroup_Validate(t *testing.T) {
 
 func TestTask_Validate(t *testing.T) {
 	task := &Task{}
-	localDisk := DefaultLocalDisk()
-	err := task.Validate(localDisk)
+	ephemeralDisk := DefaultEphemeralDisk()
+	err := task.Validate(ephemeralDisk)
 	mErr := err.(*multierror.Error)
 	if !strings.Contains(mErr.Errors[0].Error(), "task name") {
 		t.Fatalf("err: %s", err)
@@ -375,7 +375,7 @@ func TestTask_Validate(t *testing.T) {
 	}
 
 	task = &Task{Name: "web/foo"}
-	err = task.Validate(localDisk)
+	err = task.Validate(ephemeralDisk)
 	mErr = err.(*multierror.Error)
 	if !strings.Contains(mErr.Errors[0].Error(), "slashes") {
 		t.Fatalf("err: %s", err)
@@ -391,8 +391,8 @@ func TestTask_Validate(t *testing.T) {
 		},
 		LogConfig: DefaultLogConfig(),
 	}
-	localDisk.DiskMB = 200
-	err = task.Validate(localDisk)
+	ephemeralDisk.SizeMB = 200
+	err = task.Validate(ephemeralDisk)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -420,7 +420,7 @@ func TestTask_Validate_Services(t *testing.T) {
 		Name: "service-name",
 	}
 
-	localDisk := DefaultLocalDisk()
+	ephemeralDisk := DefaultEphemeralDisk()
 	task := &Task{
 		Name:   "web",
 		Driver: "docker",
@@ -431,9 +431,9 @@ func TestTask_Validate_Services(t *testing.T) {
 		},
 		Services: []*Service{s1, s2},
 	}
-	localDisk.DiskMB = 200
+	ephemeralDisk.SizeMB = 200
 
-	err := task.Validate(localDisk)
+	err := task.Validate(ephemeralDisk)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -501,14 +501,125 @@ func TestTask_Validate_LogConfig(t *testing.T) {
 	task := &Task{
 		LogConfig: DefaultLogConfig(),
 	}
-	localDisk := &LocalDisk{
-		DiskMB: 1,
+	ephemeralDisk := &EphemeralDisk{
+		SizeMB: 1,
 	}
 
-	err := task.Validate(localDisk)
+	err := task.Validate(ephemeralDisk)
 	mErr := err.(*multierror.Error)
 	if !strings.Contains(mErr.Errors[3].Error(), "log storage") {
 		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestTask_Validate_Template(t *testing.T) {
+
+	bad := &Template{}
+	task := &Task{
+		Templates: []*Template{bad},
+	}
+	ephemeralDisk := &EphemeralDisk{
+		SizeMB: 1,
+	}
+
+	err := task.Validate(ephemeralDisk)
+	if !strings.Contains(err.Error(), "Template 1 validation failed") {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Have two templates that share the same destination
+	good := &Template{
+		SourcePath: "foo",
+		DestPath:   "local/foo",
+		ChangeMode: "noop",
+	}
+
+	task.Templates = []*Template{good, good}
+	err = task.Validate(ephemeralDisk)
+	if !strings.Contains(err.Error(), "same destination as") {
+		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestTemplate_Validate(t *testing.T) {
+	cases := []struct {
+		Tmpl         *Template
+		Fail         bool
+		ContainsErrs []string
+	}{
+		{
+			Tmpl: &Template{},
+			Fail: true,
+			ContainsErrs: []string{
+				"specify a source path",
+				"specify a destination",
+				TemplateChangeModeInvalidError.Error(),
+			},
+		},
+		{
+			Tmpl: &Template{
+				Splay: -100,
+			},
+			Fail: true,
+			ContainsErrs: []string{
+				"positive splay",
+			},
+		},
+		{
+			Tmpl: &Template{
+				ChangeMode: "foo",
+			},
+			Fail: true,
+			ContainsErrs: []string{
+				TemplateChangeModeInvalidError.Error(),
+			},
+		},
+		{
+			Tmpl: &Template{
+				ChangeMode: "signal",
+			},
+			Fail: true,
+			ContainsErrs: []string{
+				"specify signal value",
+			},
+		},
+		{
+			Tmpl: &Template{
+				SourcePath: "foo",
+				DestPath:   "../../root",
+				ChangeMode: "noop",
+			},
+			Fail: true,
+			ContainsErrs: []string{
+				"destination escapes",
+			},
+		},
+		{
+			Tmpl: &Template{
+				SourcePath: "foo",
+				DestPath:   "local/foo",
+				ChangeMode: "noop",
+			},
+			Fail: false,
+		},
+	}
+
+	for i, c := range cases {
+		err := c.Tmpl.Validate()
+		if err != nil {
+			if !c.Fail {
+				t.Fatalf("Case %d: shouldn't have failed: %v", i+1, err)
+			}
+
+			e := err.Error()
+			for _, exp := range c.ContainsErrs {
+				if !strings.Contains(e, exp) {
+					t.Fatalf("Cased %d: should have contained error %q: %q", i+1, exp, e)
+				}
+			}
+		} else if c.Fail {
+			t.Fatalf("Case %d: should have failed: %v", i+1, err)
+		}
 	}
 }
 
@@ -1055,6 +1166,62 @@ func TestTaskArtifact_Validate_Dest(t *testing.T) {
 	valid.RelativeDest = "local/../.."
 	if err := valid.Validate(); err == nil {
 		t.Fatalf("expected error: %v", err)
+	}
+}
+
+func TestAllocation_ShouldMigrate(t *testing.T) {
+	alloc := Allocation{
+		TaskGroup: "foo",
+		Job: &Job{
+			TaskGroups: []*TaskGroup{
+				{
+					Name: "foo",
+					EphemeralDisk: &EphemeralDisk{
+						Migrate: true,
+						Sticky:  true,
+					},
+				},
+			},
+		},
+	}
+
+	if !alloc.ShouldMigrate() {
+		t.Fatalf("bad: %v", alloc)
+	}
+
+	alloc1 := Allocation{
+		TaskGroup: "foo",
+		Job: &Job{
+			TaskGroups: []*TaskGroup{
+				{
+					Name:          "foo",
+					EphemeralDisk: &EphemeralDisk{},
+				},
+			},
+		},
+	}
+
+	if alloc1.ShouldMigrate() {
+		t.Fatalf("bad: %v", alloc)
+	}
+
+	alloc2 := Allocation{
+		TaskGroup: "foo",
+		Job: &Job{
+			TaskGroups: []*TaskGroup{
+				{
+					Name: "foo",
+					EphemeralDisk: &EphemeralDisk{
+						Sticky:  false,
+						Migrate: true,
+					},
+				},
+			},
+		},
+	}
+
+	if alloc2.ShouldMigrate() {
+		t.Fatalf("bad: %v", alloc)
 	}
 }
 

@@ -49,9 +49,9 @@ func TestParse(t *testing.T) {
 
 				TaskGroups: []*structs.TaskGroup{
 					&structs.TaskGroup{
-						Name:      "outside",
-						Count:     1,
-						LocalDisk: structs.DefaultLocalDisk(),
+						Name:          "outside",
+						Count:         1,
+						EphemeralDisk: structs.DefaultEphemeralDisk(),
 						Tasks: []*structs.Task{
 							&structs.Task{
 								Name:   "outside",
@@ -88,9 +88,9 @@ func TestParse(t *testing.T) {
 							Delay:    15 * time.Second,
 							Mode:     "delay",
 						},
-						LocalDisk: &structs.LocalDisk{
+						EphemeralDisk: &structs.EphemeralDisk{
 							Sticky: true,
-							DiskMB: 150,
+							SizeMB: 150,
 						},
 						Tasks: []*structs.Task{
 							&structs.Task{
@@ -160,6 +160,23 @@ func TestParse(t *testing.T) {
 								},
 								Vault: &structs.Vault{
 									Policies: []string{"foo", "bar"},
+									Env:      true,
+								},
+								Templates: []*structs.Template{
+									{
+										SourcePath:   "foo",
+										DestPath:     "foo",
+										ChangeMode:   "foo",
+										ChangeSignal: "foo",
+										Splay:        10 * time.Second,
+									},
+									{
+										SourcePath:   "bar",
+										DestPath:     "bar",
+										ChangeMode:   structs.TemplateChangeModeRestart,
+										ChangeSignal: "",
+										Splay:        5 * time.Second,
+									},
 								},
 							},
 							&structs.Task{
@@ -316,9 +333,9 @@ func TestParse(t *testing.T) {
 
 				TaskGroups: []*structs.TaskGroup{
 					&structs.TaskGroup{
-						Name:      "bar",
-						Count:     1,
-						LocalDisk: structs.DefaultLocalDisk(),
+						Name:          "bar",
+						Count:         1,
+						EphemeralDisk: structs.DefaultEphemeralDisk(),
 						Tasks: []*structs.Task{
 							&structs.Task{
 								Name:   "bar",
@@ -360,9 +377,9 @@ func TestParse(t *testing.T) {
 
 				TaskGroups: []*structs.TaskGroup{
 					&structs.TaskGroup{
-						Name:      "binsl",
-						Count:     1,
-						LocalDisk: structs.DefaultLocalDisk(),
+						Name:          "binsl",
+						Count:         1,
+						EphemeralDisk: structs.DefaultEphemeralDisk(),
 						Tasks: []*structs.Task{
 							&structs.Task{
 								Name:   "binstore",
@@ -410,9 +427,9 @@ func TestParse(t *testing.T) {
 				Region:   "global",
 				TaskGroups: []*structs.TaskGroup{
 					&structs.TaskGroup{
-						Name:      "group",
-						Count:     1,
-						LocalDisk: structs.DefaultLocalDisk(),
+						Name:          "group",
+						Count:         1,
+						EphemeralDisk: structs.DefaultEphemeralDisk(),
 						Tasks: []*structs.Task{
 							&structs.Task{
 								Name: "task",
@@ -433,6 +450,57 @@ func TestParse(t *testing.T) {
 									},
 								},
 								LogConfig: structs.DefaultLogConfig(),
+							},
+						},
+					},
+				},
+			},
+			false,
+		},
+		{
+			"vault_inheritance.hcl",
+			&structs.Job{
+				ID:       "example",
+				Name:     "example",
+				Type:     "service",
+				Priority: 50,
+				Region:   "global",
+				TaskGroups: []*structs.TaskGroup{
+					&structs.TaskGroup{
+						Name:          "cache",
+						Count:         1,
+						EphemeralDisk: structs.DefaultEphemeralDisk(),
+						Tasks: []*structs.Task{
+							&structs.Task{
+								Name:      "redis",
+								LogConfig: structs.DefaultLogConfig(),
+								Vault: &structs.Vault{
+									Policies: []string{"group"},
+									Env:      true,
+								},
+							},
+							&structs.Task{
+								Name:      "redis2",
+								LogConfig: structs.DefaultLogConfig(),
+								Vault: &structs.Vault{
+									Policies: []string{"task"},
+									Env:      false,
+								},
+							},
+						},
+					},
+					&structs.TaskGroup{
+						Name:          "cache2",
+						Count:         1,
+						EphemeralDisk: structs.DefaultEphemeralDisk(),
+						Tasks: []*structs.Task{
+							&structs.Task{
+								Name:      "redis",
+								LogConfig: structs.DefaultLogConfig(),
+								Vault: &structs.Vault{
+									Policies: []string{"job"},
+									Env:      true,
+								},
 							},
 						},
 					},

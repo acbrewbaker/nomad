@@ -479,7 +479,7 @@ func (s *GenericScheduler) computePlacements(place []allocTuple) error {
 				ClientStatus:  structs.AllocClientStatusPending,
 
 				SharedResources: &structs.Resources{
-					DiskMB: missing.TaskGroup.LocalDisk.DiskMB,
+					DiskMB: missing.TaskGroup.EphemeralDisk.SizeMB,
 				},
 			}
 
@@ -511,8 +511,12 @@ func (s *GenericScheduler) findPreferredNode(allocTuple *allocTuple) (node *stru
 			err = fmt.Errorf("can't find task group of existing allocation %q", allocTuple.Alloc.ID)
 			return
 		}
-		if taskGroup.LocalDisk.Sticky == true {
-			node, err = s.state.NodeByID(allocTuple.Alloc.NodeID)
+		if taskGroup.EphemeralDisk.Sticky == true {
+			var preferredNode *structs.Node
+			preferredNode, err = s.state.NodeByID(allocTuple.Alloc.NodeID)
+			if preferredNode.Ready() {
+				node = preferredNode
+			}
 		}
 	}
 	return

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -700,6 +701,11 @@ type Node struct {
 	ModifyIndex uint64
 }
 
+// Ready returns if the node is ready for running allocations
+func (n *Node) Ready() bool {
+	return n.Status == NodeStatusReady && !n.Drain
+}
+
 func (n *Node) Copy() *Node {
 	if n == nil {
 		return nil
@@ -1277,7 +1283,6 @@ func (j *Job) VaultPolicies() map[string]map[string]*Vault {
 
 	for _, tg := range j.TaskGroups {
 		tgPolicies := make(map[string]*Vault, len(tg.Tasks))
-		policies[tg.Name] = tgPolicies
 
 		for _, task := range tg.Tasks {
 			if task.Vault == nil {
@@ -1285,6 +1290,10 @@ func (j *Job) VaultPolicies() map[string]map[string]*Vault {
 			}
 
 			tgPolicies[task.Name] = task.Vault
+		}
+
+		if len(tgPolicies) != 0 {
+			policies[tg.Name] = tgPolicies
 		}
 	}
 
@@ -1538,8 +1547,8 @@ type TaskGroup struct {
 	// Tasks are the collection of tasks that this task group needs to run
 	Tasks []*Task
 
-	// LocalDisk is the disk resources that the task group requests
-	LocalDisk *LocalDisk
+	// EphemeralDisk is the disk resources that the task group requests
+	EphemeralDisk *EphemeralDisk
 
 	// Meta is used to associate arbitrary metadata with this
 	// task group. This is opaque to Nomad.
@@ -1566,8 +1575,8 @@ func (tg *TaskGroup) Copy() *TaskGroup {
 
 	ntg.Meta = CopyMapStringString(ntg.Meta)
 
-	if tg.LocalDisk != nil {
-		ntg.LocalDisk = tg.LocalDisk.Copy()
+	if tg.EphemeralDisk != nil {
+		ntg.EphemeralDisk = tg.EphemeralDisk.Copy()
 	}
 	return ntg
 }
@@ -1617,12 +1626,12 @@ func (tg *TaskGroup) Validate() error {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("Task Group %v should have a restart policy", tg.Name))
 	}
 
-	if tg.LocalDisk != nil {
-		if err := tg.LocalDisk.Validate(); err != nil {
+	if tg.EphemeralDisk != nil {
+		if err := tg.EphemeralDisk.Validate(); err != nil {
 			mErr.Errors = append(mErr.Errors, err)
 		}
 	} else {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("Task Group %v should have a local disk object", tg.Name))
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("Task Group %v should have an ephemeral disk object", tg.Name))
 	}
 
 	// Check for duplicate tasks
@@ -1639,7 +1648,7 @@ func (tg *TaskGroup) Validate() error {
 
 	// Validate the tasks
 	for _, task := range tg.Tasks {
-		if err := task.Validate(tg.LocalDisk); err != nil {
+		if err := task.Validate(tg.EphemeralDisk); err != nil {
 			outer := fmt.Errorf("Task %s validation failed: %s", task.Name, err)
 			mErr.Errors = append(mErr.Errors, outer)
 		}
@@ -1745,12 +1754,12 @@ func (sc *ServiceCheck) validate() error {
 
 	switch sc.InitialStatus {
 	case "":
-	case api.HealthUnknown:
+		// case api.HealthUnknown: TODO: Add when Consul releases 0.7.1
 	case api.HealthPassing:
 	case api.HealthWarning:
 	case api.HealthCritical:
 	default:
-		return fmt.Errorf(`invalid initial check state (%s), must be one of %q, %q, %q, %q or empty`, sc.InitialStatus, api.HealthUnknown, api.HealthPassing, api.HealthWarning, api.HealthCritical)
+		return fmt.Errorf(`invalid initial check state (%s), must be one of %q, %q, %q, %q or empty`, sc.InitialStatus, api.HealthPassing, api.HealthWarning, api.HealthCritical)
 
 	}
 
@@ -1935,6 +1944,9 @@ type Task struct {
 	// have access to.
 	Vault *Vault
 
+	// Templates are the set of templates to be rendered for the task.
+	Templates []*Template
+
 	// Constraints can be specified at a task level and apply only to
 	// the particular task.
 	Constraints []*Constraint
@@ -1992,6 +2004,14 @@ func (t *Task) Copy() *Task {
 		nt.Config = i.(map[string]interface{})
 	}
 
+	if t.Templates != nil {
+		templates := make([]*Template, len(t.Templates))
+		for i, tmpl := range nt.Templates {
+			templates[i] = tmpl.Copy()
+		}
+		nt.Templates = templates
+	}
+
 	return nt
 }
 
@@ -2037,7 +2057,7 @@ func (t *Task) FindHostAndPortFor(portLabel string) (string, int) {
 }
 
 // Validate is used to sanity check a task
-func (t *Task) Validate(localDisk *LocalDisk) error {
+func (t *Task) Validate(ephemeralDisk *EphemeralDisk) error {
 	var mErr multierror.Error
 	if t.Name == "" {
 		mErr.Errors = append(mErr.Errors, errors.New("Missing task name"))
@@ -2087,12 +2107,12 @@ func (t *Task) Validate(localDisk *LocalDisk) error {
 		mErr.Errors = append(mErr.Errors, err)
 	}
 
-	if t.LogConfig != nil && localDisk != nil {
+	if t.LogConfig != nil && ephemeralDisk != nil {
 		logUsage := (t.LogConfig.MaxFiles * t.LogConfig.MaxFileSizeMB)
-		if localDisk.DiskMB <= logUsage {
+		if ephemeralDisk.SizeMB <= logUsage {
 			mErr.Errors = append(mErr.Errors,
 				fmt.Errorf("log storage (%d MB) must be less than requested disk capacity (%d MB)",
-					logUsage, localDisk.DiskMB))
+					logUsage, ephemeralDisk.SizeMB))
 		}
 	}
 
@@ -2106,6 +2126,21 @@ func (t *Task) Validate(localDisk *LocalDisk) error {
 	if t.Vault != nil {
 		if err := t.Vault.Validate(); err != nil {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("Vault validation failed: %v", err))
+		}
+	}
+
+	destinations := make(map[string]int, len(t.Templates))
+	for idx, tmpl := range t.Templates {
+		if err := tmpl.Validate(); err != nil {
+			outer := fmt.Errorf("Template %d validation failed: %s", idx+1, err)
+			mErr.Errors = append(mErr.Errors, outer)
+		}
+
+		if other, ok := destinations[tmpl.DestPath]; ok {
+			outer := fmt.Errorf("Template %d has same destination as %d", idx+1, other)
+			mErr.Errors = append(mErr.Errors, outer)
+		} else {
+			destinations[tmpl.DestPath] = idx + 1
 		}
 	}
 
@@ -2168,6 +2203,108 @@ func validateServices(t *Task) error {
 	return mErr.ErrorOrNil()
 }
 
+const (
+	// TemplateChangeModeNoop marks that no action should be taken if the
+	// template is re-rendered
+	TemplateChangeModeNoop = "noop"
+
+	// TemplateChangeModeSignal marks that the task should be signaled if the
+	// template is re-rendered
+	TemplateChangeModeSignal = "signal"
+
+	// TemplateChangeModeRestart marks that the task should be restarted if the
+	// template is re-rendered
+	TemplateChangeModeRestart = "restart"
+)
+
+var (
+	// TemplateChangeModeInvalidError is the error for when an invalid change
+	// mode is given
+	TemplateChangeModeInvalidError = errors.New("Invalid change mode. Must be one of the following: noop, signal, restart")
+)
+
+// Template represents a template configuration to be rendered for a given task
+type Template struct {
+	// SourcePath is the the path to the template to be rendered
+	SourcePath string `mapstructure:"source"`
+
+	// DestPath is the path to where the template should be rendered
+	DestPath string `mapstructure:"destination"`
+
+	// EmbeddedTmpl store the raw template. This is useful for smaller templates
+	// where they are embedded in the job file rather than sent as an artificat
+	EmbeddedTmpl string `mapstructure:"data"`
+
+	// ChangeMode indicates what should be done if the template is re-rendered
+	ChangeMode string `mapstructure:"change_mode"`
+
+	// ChangeSignal is the signal that should be sent if the change mode
+	// requires it.
+	ChangeSignal string `mapstructure:"change_signal"`
+
+	// Splay is used to avoid coordinated restarts of processes by applying a
+	// random wait between 0 and the given splay value before signalling the
+	// application of a change
+	Splay time.Duration `mapstructure:"splay"`
+}
+
+// DefaultTemplate returns a default template.
+func DefaultTemplate() *Template {
+	return &Template{
+		ChangeMode: TemplateChangeModeRestart,
+		Splay:      5 * time.Second,
+	}
+}
+
+func (t *Template) Copy() *Template {
+	if t == nil {
+		return nil
+	}
+	copy := new(Template)
+	*copy = *t
+	return copy
+}
+
+func (t *Template) Validate() error {
+	var mErr multierror.Error
+
+	// Verify we have something to render
+	if t.SourcePath == "" && t.EmbeddedTmpl == "" {
+		multierror.Append(&mErr, fmt.Errorf("Must specify a source path or have an embedded template"))
+	}
+
+	// Verify we can render somewhere
+	if t.DestPath == "" {
+		multierror.Append(&mErr, fmt.Errorf("Must specify a destination for the template"))
+	}
+
+	// Verify the destination doesn't escape
+	escaped, err := PathEscapesAllocDir(t.DestPath)
+	if err != nil {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid destination path: %v", err))
+	} else if escaped {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("destination escapes allocation directory"))
+	}
+
+	// Verify a proper change mode
+	switch t.ChangeMode {
+	case TemplateChangeModeNoop, TemplateChangeModeRestart:
+	case TemplateChangeModeSignal:
+		if t.ChangeSignal == "" {
+			multierror.Append(&mErr, fmt.Errorf("Must specify signal value when change mode is signal"))
+		}
+	default:
+		multierror.Append(&mErr, TemplateChangeModeInvalidError)
+	}
+
+	// Verify the splay is positive
+	if t.Splay < 0 {
+		multierror.Append(&mErr, fmt.Errorf("Must specify positive splay value"))
+	}
+
+	return mErr.ErrorOrNil()
+}
+
 // Set of possible states for a task.
 const (
 	TaskStatePending = "pending" // The task is waiting to be run.
@@ -2209,7 +2346,8 @@ func (ts *TaskState) Failed() bool {
 	}
 
 	switch ts.Events[l-1].Type {
-	case TaskDiskExceeded, TaskNotRestarting, TaskArtifactDownloadFailed, TaskFailedValidation:
+	case TaskDiskExceeded, TaskNotRestarting, TaskArtifactDownloadFailed,
+		TaskFailedValidation, TaskVaultRenewalFailed:
 		return true
 	default:
 		return false
@@ -2264,6 +2402,13 @@ const (
 	// restarted because it has exceeded its restart policy.
 	TaskNotRestarting = "Not Restarting"
 
+	// TaskRestartSignal indicates that the task has been signalled to be
+	// restarted
+	TaskRestartSignal = "Restart Signaled"
+
+	// TaskSignaling indicates that the task is being signalled.
+	TaskSignaling = "Signaling"
+
 	// TaskDownloadingArtifacts means the task is downloading the artifacts
 	// specified in the task.
 	TaskDownloadingArtifacts = "Downloading Artifacts"
@@ -2279,6 +2424,9 @@ const (
 	// TaskSiblingFailed indicates that a sibling task in the task group has
 	// failed.
 	TaskSiblingFailed = "Sibling task failed"
+
+	// TaskVaultRenewalFailed indicates that Vault token renewal failed
+	TaskVaultRenewalFailed = "Vault token renewal failed"
 )
 
 // TaskEvent is an event that effects the state of a task and contains meta-data
@@ -2304,6 +2452,9 @@ type TaskEvent struct {
 	// Task Killed Fields.
 	KillError string // Error killing the task.
 
+	// KillReason is the reason the task was killed
+	KillReason string
+
 	// TaskRestarting fields.
 	StartDelay int64 // The sleep period before restarting the task in unix nanoseconds.
 
@@ -2322,6 +2473,15 @@ type TaskEvent struct {
 	// Name of the sibling task that caused termination of the task that
 	// the TaskEvent refers to.
 	FailedSibling string
+
+	// VaultError is the error from token renewal
+	VaultError string
+
+	// TaskSignalReason indicates the reason the task is being signalled.
+	TaskSignalReason string
+
+	// TaskSignal is the signal that was sent to the task
+	TaskSignal string
 }
 
 func (te *TaskEvent) GoString() string {
@@ -2375,6 +2535,11 @@ func (e *TaskEvent) SetKillError(err error) *TaskEvent {
 	return e
 }
 
+func (e *TaskEvent) SetKillReason(r string) *TaskEvent {
+	e.KillReason = r
+	return e
+}
+
 func (e *TaskEvent) SetRestartDelay(delay time.Duration) *TaskEvent {
 	e.StartDelay = int64(delay)
 	return e
@@ -2382,6 +2547,16 @@ func (e *TaskEvent) SetRestartDelay(delay time.Duration) *TaskEvent {
 
 func (e *TaskEvent) SetRestartReason(reason string) *TaskEvent {
 	e.RestartReason = reason
+	return e
+}
+
+func (e *TaskEvent) SetTaskSignalReason(r string) *TaskEvent {
+	e.TaskSignalReason = r
+	return e
+}
+
+func (e *TaskEvent) SetTaskSignal(s os.Signal) *TaskEvent {
+	e.TaskSignal = s.String()
 	return e
 }
 
@@ -2419,6 +2594,13 @@ func (e *TaskEvent) SetFailedSibling(sibling string) *TaskEvent {
 	return e
 }
 
+func (e *TaskEvent) SetVaultRenewalError(err error) *TaskEvent {
+	if err != nil {
+		e.VaultError = err.Error()
+	}
+	return e
+}
+
 // TaskArtifact is an artifact to download before running the task.
 type TaskArtifact struct {
 	// GetterSource is the source to download an artifact using go-getter
@@ -2447,6 +2629,26 @@ func (ta *TaskArtifact) GoString() string {
 	return fmt.Sprintf("%+v", ta)
 }
 
+// PathEscapesAllocDir returns if the given path escapes the allocation
+// directory
+func PathEscapesAllocDir(path string) (bool, error) {
+	// Verify the destination doesn't escape the tasks directory
+	alloc, err := filepath.Abs(filepath.Join("/", "foo/", "bar/"))
+	if err != nil {
+		return false, err
+	}
+	abs, err := filepath.Abs(filepath.Join(alloc, path))
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(alloc, abs)
+	if err != nil {
+		return false, err
+	}
+
+	return strings.HasPrefix(rel, ".."), nil
+}
+
 func (ta *TaskArtifact) Validate() error {
 	// Verify the source
 	var mErr multierror.Error
@@ -2454,23 +2656,10 @@ func (ta *TaskArtifact) Validate() error {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("source must be specified"))
 	}
 
-	// Verify the destination doesn't escape the tasks directory
-	alloc, err := filepath.Abs(filepath.Join("/", "foo/", "bar/"))
+	escaped, err := PathEscapesAllocDir(ta.RelativeDest)
 	if err != nil {
-		mErr.Errors = append(mErr.Errors, err)
-		return mErr.ErrorOrNil()
-	}
-	abs, err := filepath.Abs(filepath.Join(alloc, ta.RelativeDest))
-	if err != nil {
-		mErr.Errors = append(mErr.Errors, err)
-		return mErr.ErrorOrNil()
-	}
-	rel, err := filepath.Rel(alloc, abs)
-	if err != nil {
-		mErr.Errors = append(mErr.Errors, err)
-		return mErr.ErrorOrNil()
-	}
-	if strings.HasPrefix(rel, "..") {
+		mErr.Errors = append(mErr.Errors, fmt.Errorf("invalid destination path: %v", err))
+	} else if escaped {
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("destination escapes task's directory"))
 	}
 
@@ -2534,6 +2723,13 @@ type Constraint struct {
 	str     string // Memoized string
 }
 
+// Equal checks if two constraints are equal
+func (c *Constraint) Equal(o *Constraint) bool {
+	return c.LTarget == o.LTarget &&
+		c.RTarget == o.RTarget &&
+		c.Operand == o.Operand
+}
+
 func (c *Constraint) Copy() *Constraint {
 	if c == nil {
 		return nil
@@ -2571,33 +2767,37 @@ func (c *Constraint) Validate() error {
 	return mErr.ErrorOrNil()
 }
 
-// LocalDisk is an ephemeral disk object
-type LocalDisk struct {
+// EphemeralDisk is an ephemeral disk object
+type EphemeralDisk struct {
 	// Sticky indicates whether the allocation is sticky to a node
 	Sticky bool
 
-	// DiskMB is the size of the local disk
-	DiskMB int `mapstructure:"disk"`
+	// SizeMB is the size of the local disk
+	SizeMB int `mapstructure:"size"`
+
+	// Migrate determines if Nomad client should migrate the allocation dir for
+	// sticky allocations
+	Migrate bool
 }
 
-// DefaultLocalDisk returns a LocalDisk with default configurations
-func DefaultLocalDisk() *LocalDisk {
-	return &LocalDisk{
-		DiskMB: 300,
+// DefaultEphemeralDisk returns a EphemeralDisk with default configurations
+func DefaultEphemeralDisk() *EphemeralDisk {
+	return &EphemeralDisk{
+		SizeMB: 300,
 	}
 }
 
-// Validate validates LocalDisk
-func (d *LocalDisk) Validate() error {
-	if d.DiskMB < 10 {
-		return fmt.Errorf("minimum DiskMB value is 10; got %d", d.DiskMB)
+// Validate validates EphemeralDisk
+func (d *EphemeralDisk) Validate() error {
+	if d.SizeMB < 10 {
+		return fmt.Errorf("minimum DiskMB value is 10; got %d", d.SizeMB)
 	}
 	return nil
 }
 
-// Copy copies the LocalDisk struct and returns a new one
-func (d *LocalDisk) Copy() *LocalDisk {
-	ld := new(LocalDisk)
+// Copy copies the EphemeralDisk struct and returns a new one
+func (d *EphemeralDisk) Copy() *EphemeralDisk {
+	ld := new(EphemeralDisk)
 	*ld = *d
 	return ld
 }
@@ -2606,6 +2806,10 @@ func (d *LocalDisk) Copy() *LocalDisk {
 type Vault struct {
 	// Policies is the set of policies that the task needs access to
 	Policies []string
+
+	// Env marks whether the Vault Token should be exposed as an environment
+	// variable
+	Env bool
 }
 
 // Copy returns a copy of this Vault block.
@@ -2810,6 +3014,19 @@ func (a *Allocation) Stub() *AllocListStub {
 		ModifyIndex:        a.ModifyIndex,
 		CreateTime:         a.CreateTime,
 	}
+}
+
+// ShouldMigrate returns if the allocation needs data migration
+func (a *Allocation) ShouldMigrate() bool {
+	if a.DesiredStatus == AllocDesiredStatusStop || a.DesiredStatus == AllocDesiredStatusEvict {
+		return false
+	}
+
+	if tg := a.Job.LookupTaskGroup(a.TaskGroup); tg != nil && !tg.EphemeralDisk.Migrate || !tg.EphemeralDisk.Sticky {
+		return false
+	}
+
+	return true
 }
 
 var (

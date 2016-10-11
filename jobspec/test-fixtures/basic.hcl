@@ -42,9 +42,9 @@ job "binstore-storagelocker" {
       mode     = "delay"
     }
 
-    local_disk {
+    ephemeral_disk {
         sticky = true
-        disk   = 150
+        size = 150
     }
 
     task "binstore" {
@@ -132,6 +132,19 @@ job "binstore-storagelocker" {
 
       vault {
         policies = ["foo", "bar"]
+      }
+
+      template {
+        source = "foo"
+        destination = "foo"
+        change_mode = "foo"
+        change_signal = "foo"
+        splay = "10s"
+      }
+
+      template {
+        source = "bar"
+        destination = "bar"
       }
     }
 

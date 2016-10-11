@@ -190,15 +190,20 @@ func diffSystemAllocs(job *structs.Job, nodes []*structs.Node, taintedNodes map[
 	for nodeID, allocs := range nodeAllocs {
 		diff := diffAllocs(job, taintedNodes, required, allocs, terminalAllocs)
 
-		// Mark the alloc as being for a specific node.
-		for i := range diff.place {
-			alloc := &diff.place[i]
+		// If the node is tainted there should be no placements made
+		if _, ok := taintedNodes[nodeID]; ok {
+			diff.place = nil
+		} else {
+			// Mark the alloc as being for a specific node.
+			for i := range diff.place {
+				alloc := &diff.place[i]
 
-			// If the new allocation isn't annotated with a previous allocation
-			// or if the previous allocation isn't from the same node then we
-			// annotate the allocTuple with a new Allocation
-			if alloc.Alloc == nil || alloc.Alloc.NodeID != nodeID {
-				alloc.Alloc = &structs.Allocation{NodeID: nodeID}
+				// If the new allocation isn't annotated with a previous allocation
+				// or if the previous allocation isn't from the same node then we
+				// annotate the allocTuple with a new Allocation
+				if alloc.Alloc == nil || alloc.Alloc.NodeID != nodeID {
+					alloc.Alloc = &structs.Allocation{NodeID: nodeID}
+				}
 			}
 		}
 
@@ -330,6 +335,11 @@ func tasksUpdated(a, b *structs.TaskGroup) bool {
 		return true
 	}
 
+	// Check ephemeral disk
+	if !reflect.DeepEqual(a.EphemeralDisk, b.EphemeralDisk) {
+		return true
+	}
+
 	// Check each task
 	for _, at := range a.Tasks {
 		bt := b.LookupTask(at.Name)
@@ -352,6 +362,9 @@ func tasksUpdated(a, b *structs.TaskGroup) bool {
 			return true
 		}
 		if !reflect.DeepEqual(at.Artifacts, bt.Artifacts) {
+			return true
+		}
+		if !reflect.DeepEqual(at.Vault, bt.Vault) {
 			return true
 		}
 
@@ -377,8 +390,6 @@ func tasksUpdated(a, b *structs.TaskGroup) bool {
 		if ar, br := at.Resources, bt.Resources; ar.CPU != br.CPU {
 			return true
 		} else if ar.MemoryMB != br.MemoryMB {
-			return true
-		} else if ar.DiskMB != br.DiskMB {
 			return true
 		} else if ar.IOPS != br.IOPS {
 			return true
@@ -562,7 +573,7 @@ func taskGroupConstraints(tg *structs.TaskGroup) tgConstrainTuple {
 	c := tgConstrainTuple{
 		constraints: make([]*structs.Constraint, 0, len(tg.Constraints)),
 		drivers:     make(map[string]struct{}),
-		size:        &structs.Resources{DiskMB: tg.LocalDisk.DiskMB},
+		size:        &structs.Resources{DiskMB: tg.EphemeralDisk.SizeMB},
 	}
 
 	c.constraints = append(c.constraints, tg.Constraints...)

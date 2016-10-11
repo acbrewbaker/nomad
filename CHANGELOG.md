@@ -4,20 +4,30 @@ IMPROVEMENTS:
   * core: Introduce node SecretID which can be used to minimize the available
     surface area of RPCs to malicious Nomad Clients [GH-1597] 
   * cli: `nomad alloc-status` shows allocation creation time [GH-1623]
+  * client: Failed RPCs are retried on all servers [GH-1735]
   * client: Enforce shared allocation directory disk usage [GH-1580]
   * client: Introduce a `secrets/` directory to tasks where sensitive data can
     be written [GH-1681]
+  * driver/docker: Support Docker volumes [GH-1767]
+  * driver/docker: Allow Docker logging to be configured [GH-1767]
 
 BUG FIXES:
+  * client: Prevent race when persisting state file [GH-1682]
   * client: Artifact download failures will be retried before failing tasks
     [GH-1558]
+  * client: Fix a crash related to stats publishing when driver hasn't started
+    yet [GH-1723]
+  * client: Fix a memory leak in the executor that caused failed allocations
+    [GH-1762]
   * client/fingerprint: Fix inconsistent CPU MHz fingerprinting [GH-1366]
-  * discovery: Fix old services not getting removed from consul on update
+  * discovery: Fix old services not getting removed from Consul on update
     [GH-1668]
   * discovery: Fix HTTP timeout with Server HTTP health check when there is no
     leader [GH-1656]
+  * discovery: Fix client flapping when server is in a different datacenter as
+    the client [GH-1641]
 
-## 0.4.1
+## 0.4.1 (August 18, 2016)
 
 __BACKWARDS INCOMPATIBILITIES:__
   * telemetry: Operators will have to explicitly opt-in for Nomad client to
@@ -85,7 +95,7 @@ BUG FIXES:
   * plan: Plan on system jobs discounts nodes that do not meet required
     constraints [GH-1568]
 
-## 0.4.0
+## 0.4.0 (June 28, 2016)
 
 __BACKWARDS INCOMPATIBILITIES:__
   * api: Tasks are no longer allowed to have slashes in their name [GH-1210]

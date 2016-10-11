@@ -1,16 +1,19 @@
 package client
 
 import (
+	"archive/tar"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/armon/go-metrics"
@@ -21,7 +24,6 @@ import (
 	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver"
 	"github.com/hashicorp/nomad/client/fingerprint"
-	"github.com/hashicorp/nomad/client/rpcproxy"
 	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/client/vaultclient"
 	"github.com/hashicorp/nomad/command/agent/consul"
@@ -44,6 +46,10 @@ const (
 	// datacenters looking for the Nomad server service.
 	datacenterQueryLimit = 9
 
+	// consulReaperIntv is the interval at which the Consul reaper will
+	// run.
+	consulReaperIntv = 5 * time.Second
+
 	// registerRetryIntv is minimum interval on which we retry
 	// registration. We pick a value between this and 2x this.
 	registerRetryIntv = 15 * time.Second
@@ -57,11 +63,6 @@ const (
 
 	// stateSnapshotIntv is how often the client snapshots state
 	stateSnapshotIntv = 60 * time.Second
-
-	// registerErrGrace is the grace period where we don't log about
-	// register errors after start. This is to improve the user experience
-	// in dev mode where the leader isn't elected for a few seconds.
-	registerErrGrace = 10 * time.Second
 
 	// initialHeartbeatStagger is used to stagger the interval between
 	// starting and the intial heartbeat. After the intial heartbeat,
@@ -105,26 +106,22 @@ type Client struct {
 
 	logger *log.Logger
 
-	rpcProxy *rpcproxy.RPCProxy
-
 	connPool *nomad.ConnPool
 
-	// lastHeartbeatFromQuorum is an atomic int32 acting as a bool.  When
-	// true, the last heartbeat message had a leader.  When false (0),
-	// the last heartbeat did not include the RPC address of the leader,
-	// indicating that the server is in the minority or middle of an
-	// election.
-	lastHeartbeatFromQuorum int32
+	// servers is the (optionally prioritized) list of nomad servers
+	servers *serverlist
 
-	// consulPullHeartbeatDeadline is the deadline at which this Nomad
-	// Agent will begin polling Consul for a list of Nomad Servers.  When
-	// Nomad Clients are heartbeating successfully with Nomad Servers,
-	// Nomad Clients do not poll Consul to populate their backup server
-	// list.
-	consulPullHeartbeatDeadline time.Time
-	lastHeartbeat               time.Time
-	heartbeatTTL                time.Duration
-	heartbeatLock               sync.Mutex
+	// heartbeat related times for tracking how often to heartbeat
+	lastHeartbeat time.Time
+	heartbeatTTL  time.Duration
+	heartbeatLock sync.Mutex
+
+	// triggerDiscoveryCh triggers Consul discovery; see triggerDiscovery
+	triggerDiscoveryCh chan struct{}
+
+	// discovered will be ticked whenever Consul discovery completes
+	// succesfully
+	serversDiscoveredCh chan struct{}
 
 	// allocs is the current set of allocations
 	allocs    map[string]*AllocRunner
@@ -150,24 +147,39 @@ type Client struct {
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
 
-	// client to interact with vault for token and secret renewals
+	// vaultClient is used to interact with Vault for token and secret renewals
 	vaultClient vaultclient.VaultClient
+
+	// migratingAllocs is the set of allocs whose data migration is in flight
+	migratingAllocs     map[string]chan struct{}
+	migratingAllocsLock sync.Mutex
 }
+
+var (
+	// noServersErr is returned by the RPC method when the client has no
+	// configured servers. This is used to trigger Consul discovery if
+	// enabled.
+	noServersErr = errors.New("no servers")
+)
 
 // NewClient is used to create a new client from the given configuration
 func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logger) (*Client, error) {
 	// Create the client
 	c := &Client{
-		config:             cfg,
-		consulSyncer:       consulSyncer,
-		start:              time.Now(),
-		connPool:           nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
-		logger:             logger,
-		hostStatsCollector: stats.NewHostStatsCollector(),
-		allocs:             make(map[string]*AllocRunner),
-		blockedAllocations: make(map[string]*structs.Allocation),
-		allocUpdates:       make(chan *structs.Allocation, 64),
-		shutdownCh:         make(chan struct{}),
+		config:              cfg,
+		consulSyncer:        consulSyncer,
+		start:               time.Now(),
+		connPool:            nomad.NewPool(cfg.LogOutput, clientRPCCache, clientMaxStreams, nil),
+		logger:              logger,
+		hostStatsCollector:  stats.NewHostStatsCollector(),
+		allocs:              make(map[string]*AllocRunner),
+		blockedAllocations:  make(map[string]*structs.Allocation),
+		allocUpdates:        make(chan *structs.Allocation, 64),
+		shutdownCh:          make(chan struct{}),
+		migratingAllocs:     make(map[string]chan struct{}),
+		servers:             newServerList(),
+		triggerDiscoveryCh:  make(chan struct{}),
+		serversDiscoveredCh: make(chan struct{}),
 	}
 
 	// Initialize the client
@@ -199,28 +211,35 @@ func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logg
 	c.configCopy = c.config.Copy()
 	c.configLock.Unlock()
 
-	// Create the RPC Proxy and bootstrap with the preconfigured list of
-	// static servers
+	// Set the preconfigured list of static servers
 	c.configLock.RLock()
-	c.rpcProxy = rpcproxy.NewRPCProxy(c.logger, c.shutdownCh, c, c.connPool)
-	for _, serverAddr := range c.configCopy.Servers {
-		c.rpcProxy.AddPrimaryServer(serverAddr)
+	if len(c.configCopy.Servers) > 0 {
+		if err := c.SetServers(c.configCopy.Servers); err != nil {
+			logger.Printf("[WARN] client: None of the configured servers are valid: %v", err)
+		}
 	}
 	c.configLock.RUnlock()
 
-	// Restore the state
-	if err := c.restoreState(); err != nil {
-		return nil, fmt.Errorf("failed to restore state: %v", err)
+	// Setup Consul discovery if enabled
+	if c.configCopy.ConsulConfig.ClientAutoJoin {
+		go c.consulDiscovery()
+		if len(c.servers.all()) == 0 {
+			// No configured servers; trigger discovery manually
+			c.triggerDiscoveryCh <- struct{}{}
+		}
 	}
 
-	// Setup the Consul syncer
-	if err := c.setupConsulSyncer(); err != nil {
-		return nil, fmt.Errorf("failed to create client Consul syncer: %v", err)
-	}
+	// Start Consul reaper
+	go c.consulReaper()
 
 	// Setup the vault client for token and secret renewals
 	if err := c.setupVaultClient(); err != nil {
 		return nil, fmt.Errorf("failed to setup vault client: %v", err)
+	}
+
+	// Restore the state
+	if err := c.restoreState(); err != nil {
+		return nil, fmt.Errorf("failed to restore state: %v", err)
 	}
 
 	// Register and then start heartbeating to the servers.
@@ -237,21 +256,6 @@ func NewClient(cfg *config.Config, consulSyncer *consul.Syncer, logger *log.Logg
 
 	// Start collecting stats
 	go c.collectHostStats()
-
-	// Start the RPCProxy maintenance task.  This task periodically
-	// shuffles the list of Nomad Server Endpoints this Client will use
-	// when communicating with Nomad Servers via RPC.  This is done in
-	// order to prevent server fixation in stable Nomad clusters.  This
-	// task actively populates the active list of Nomad Server Endpoints
-	// from information from the Nomad Client heartbeats.  If a heartbeat
-	// times out and there are no Nomad servers available, this data is
-	// populated by periodically polling Consul, if available.
-	go c.rpcProxy.Run()
-
-	// Start renewing tokens and secrets
-	if c.vaultClient != nil {
-		c.vaultClient.Start()
-	}
 
 	return c, nil
 }
@@ -355,33 +359,38 @@ func (c *Client) Shutdown() error {
 	return c.saveState()
 }
 
-// RPC is used to forward an RPC call to a nomad server, or fail if no servers
+// RPC is used to forward an RPC call to a nomad server, or fail if no servers.
 func (c *Client) RPC(method string, args interface{}, reply interface{}) error {
 	// Invoke the RPCHandler if it exists
 	if c.config.RPCHandler != nil {
 		return c.config.RPCHandler.RPC(method, args, reply)
 	}
 
-	// Pick a server to request from
-	server := c.rpcProxy.FindServer()
-	if server == nil {
-		return fmt.Errorf("no known servers")
+	servers := c.servers.all()
+	if len(servers) == 0 {
+		return noServersErr
 	}
 
-	// Make the RPC request
-	if err := c.connPool.RPC(c.Region(), server.Addr, c.RPCMajorVersion(), method, args, reply); err != nil {
-		c.rpcProxy.NotifyFailedServer(server)
-		return fmt.Errorf("RPC failed to server %s: %v", server.Addr, err)
+	var mErr multierror.Error
+	for _, s := range servers {
+		// Make the RPC request
+		if err := c.connPool.RPC(c.Region(), s.addr, c.RPCMajorVersion(), method, args, reply); err != nil {
+			errmsg := fmt.Errorf("RPC failed to server %s: %v", s.addr, err)
+			mErr.Errors = append(mErr.Errors, errmsg)
+			c.logger.Printf("[DEBUG] client: %v", errmsg)
+			c.servers.failed(s)
+			continue
+		}
+		c.servers.good(s)
+		return nil
 	}
-	return nil
+
+	return mErr.ErrorOrNil()
 }
 
 // Stats is used to return statistics for debugging and insight
 // for various sub-systems
 func (c *Client) Stats() map[string]map[string]string {
-	toString := func(v uint64) string {
-		return strconv.FormatUint(v, 10)
-	}
 	c.allocLock.RLock()
 	numAllocs := len(c.allocs)
 	c.allocLock.RUnlock()
@@ -391,8 +400,8 @@ func (c *Client) Stats() map[string]map[string]string {
 	stats := map[string]map[string]string{
 		"client": map[string]string{
 			"node_id":         c.Node().ID,
-			"known_servers":   toString(uint64(c.rpcProxy.NumServers())),
-			"num_allocations": toString(uint64(numAllocs)),
+			"known_servers":   c.servers.all().String(),
+			"num_allocations": strconv.Itoa(numAllocs),
 			"last_heartbeat":  fmt.Sprintf("%v", time.Since(c.lastHeartbeat)),
 			"heartbeat_ttl":   fmt.Sprintf("%v", c.heartbeatTTL),
 		},
@@ -440,13 +449,47 @@ func (c *Client) GetAllocFS(allocID string) (allocdir.AllocDirFS, error) {
 	if !ok {
 		return nil, fmt.Errorf("alloc not found")
 	}
-	return ar.ctx.AllocDir, nil
+	return ar.GetAllocDir(), nil
 }
 
-// AddPrimaryServerToRPCProxy adds serverAddr to the RPC Proxy's primary
-// server list.
-func (c *Client) AddPrimaryServerToRPCProxy(serverAddr string) *rpcproxy.ServerEndpoint {
-	return c.rpcProxy.AddPrimaryServer(serverAddr)
+// GetServers returns the list of nomad servers this client is aware of.
+func (c *Client) GetServers() []string {
+	endpoints := c.servers.all()
+	res := make([]string, len(endpoints))
+	for i := range endpoints {
+		res[i] = endpoints[i].addr.String()
+	}
+	return res
+}
+
+// SetServers sets a new list of nomad servers to connect to. As long as one
+// server is resolvable no error is returned.
+func (c *Client) SetServers(servers []string) error {
+	endpoints := make([]*endpoint, 0, len(servers))
+	var merr multierror.Error
+	for _, s := range servers {
+		addr, err := resolveServer(s)
+		if err != nil {
+			c.logger.Printf("[DEBUG] client: ignoring server %s due to resolution error: %v", s, err)
+			merr.Errors = append(merr.Errors, err)
+			continue
+		}
+
+		// Valid endpoint, append it without a priority as this API
+		// doesn't support different priorities for different servers
+		endpoints = append(endpoints, &endpoint{name: s, addr: addr})
+	}
+
+	// Only return errors if no servers are valid
+	if len(endpoints) == 0 {
+		if len(merr.Errors) > 0 {
+			return merr.ErrorOrNil()
+		}
+		return noServersErr
+	}
+
+	c.servers.set(endpoints)
+	return nil
 }
 
 // restoreState is used to restore our state from the data dir
@@ -469,7 +512,7 @@ func (c *Client) restoreState() error {
 		id := entry.Name()
 		alloc := &structs.Allocation{ID: id}
 		c.configLock.RLock()
-		ar := NewAllocRunner(c.logger, c.configCopy, c.updateAllocStatus, alloc)
+		ar := NewAllocRunner(c.logger, c.configCopy, c.updateAllocStatus, alloc, c.vaultClient)
 		c.configLock.RUnlock()
 		c.allocLock.Lock()
 		c.allocs[id] = ar
@@ -785,27 +828,32 @@ func (c *Client) registerAndHeartbeat() {
 
 	for {
 		select {
+		case <-c.serversDiscoveredCh:
 		case <-heartbeat:
-			if err := c.updateNodeStatus(); err != nil {
-				// The servers have changed such that this node has not been
-				// registered before
-				if strings.Contains(err.Error(), "node not found") {
-					// Re-register the node
-					c.logger.Printf("[INFO] client: re-registering node")
-					c.retryRegisterNode()
-					heartbeat = time.After(lib.RandomStagger(initialHeartbeatStagger))
-				} else {
-					c.logger.Printf("[ERR] client: heartbeating failed: %v", err)
-					heartbeat = time.After(c.retryIntv(registerRetryIntv))
-				}
-			} else {
-				c.heartbeatLock.Lock()
-				heartbeat = time.After(c.heartbeatTTL)
-				c.heartbeatLock.Unlock()
-			}
-
 		case <-c.shutdownCh:
 			return
+		}
+
+		if err := c.updateNodeStatus(); err != nil {
+			// The servers have changed such that this node has not been
+			// registered before
+			if strings.Contains(err.Error(), "node not found") {
+				// Re-register the node
+				c.logger.Printf("[INFO] client: re-registering node")
+				c.retryRegisterNode()
+				heartbeat = time.After(lib.RandomStagger(initialHeartbeatStagger))
+			} else {
+				intv := c.retryIntv(registerRetryIntv)
+				c.logger.Printf("[ERR] client: heartbeating failed. Retrying in %v: %v", intv, err)
+				heartbeat = time.After(intv)
+
+				// if heartbeating fails, trigger Consul discovery
+				c.triggerDiscovery()
+			}
+		} else {
+			c.heartbeatLock.Lock()
+			heartbeat = time.After(c.heartbeatTTL)
+			c.heartbeatLock.Unlock()
 		}
 	}
 }
@@ -872,14 +920,21 @@ func (c *Client) hasNodeChanged(oldAttrHash uint64, oldMetaHash uint64) (bool, u
 // retryRegisterNode is used to register the node or update the registration and
 // retry in case of failure.
 func (c *Client) retryRegisterNode() {
-	// Register the client
 	for {
-		if err := c.registerNode(); err == nil {
-			break
+		err := c.registerNode()
+		if err == nil {
+			// Registered!
+			return
+		}
+
+		if err == noServersErr {
+			c.logger.Print("[DEBUG] client: registration waiting on servers")
+			c.triggerDiscovery()
 		} else {
-			c.logger.Printf("[ERR] client: %v", err)
+			c.logger.Printf("[ERR] client: registration failure: %v", err)
 		}
 		select {
+		case <-c.serversDiscoveredCh:
 		case <-time.After(c.retryIntv(registerRetryIntv)):
 		case <-c.shutdownCh:
 			return
@@ -896,9 +951,6 @@ func (c *Client) registerNode() error {
 	}
 	var resp structs.NodeUpdateResponse
 	if err := c.RPC("Node.Register", &req, &resp); err != nil {
-		if time.Since(c.start) > registerErrGrace {
-			return fmt.Errorf("failed to register node: %v", err)
-		}
 		return err
 	}
 
@@ -907,7 +959,7 @@ func (c *Client) registerNode() error {
 	node.Status = structs.NodeStatusReady
 	c.configLock.Unlock()
 
-	c.logger.Printf("[DEBUG] client: node registration complete")
+	c.logger.Printf("[INFO] client: node registration complete")
 	if len(resp.EvalIDs) != 0 {
 		c.logger.Printf("[DEBUG] client: %d evaluations triggered by node registration", len(resp.EvalIDs))
 	}
@@ -921,6 +973,9 @@ func (c *Client) registerNode() error {
 
 // updateNodeStatus is used to heartbeat and update the status of the node
 func (c *Client) updateNodeStatus() error {
+	c.heartbeatLock.Lock()
+	defer c.heartbeatLock.Unlock()
+
 	node := c.Node()
 	req := structs.NodeUpdateStatusRequest{
 		NodeID:       node.ID,
@@ -929,6 +984,7 @@ func (c *Client) updateNodeStatus() error {
 	}
 	var resp structs.NodeUpdateResponse
 	if err := c.RPC("Node.UpdateStatus", &req, &resp); err != nil {
+		c.triggerDiscovery()
 		return fmt.Errorf("failed to update status: %v", err)
 	}
 	if len(resp.EvalIDs) != 0 {
@@ -938,14 +994,29 @@ func (c *Client) updateNodeStatus() error {
 		c.logger.Printf("[DEBUG] client: state updated to %s", req.Status)
 	}
 
-	c.heartbeatLock.Lock()
-	defer c.heartbeatLock.Unlock()
+	// Update heartbeat time and ttl
 	c.lastHeartbeat = time.Now()
 	c.heartbeatTTL = resp.HeartbeatTTL
 
-	if err := c.rpcProxy.RefreshServerLists(resp.Servers, resp.NumNodes, resp.LeaderRPCAddr); err != nil {
-		return err
+	// Convert []*NodeServerInfo to []*endpoints
+	localdc := c.Datacenter()
+	servers := make(endpoints, 0, len(resp.Servers))
+	for _, s := range resp.Servers {
+		addr, err := resolveServer(s.RPCAdvertiseAddr)
+		if err != nil {
+			continue
+		}
+		e := endpoint{name: s.RPCAdvertiseAddr, addr: addr}
+		if s.Datacenter != localdc {
+			// server is non-local; de-prioritize
+			e.priority = 1
+		}
+		servers = append(servers, &e)
 	}
+	if len(servers) == 0 {
+		return fmt.Errorf("server returned no valid servers")
+	}
+	c.servers.set(servers)
 
 	// Begin polling Consul if there is no Nomad leader.  We could be
 	// heartbeating to a Nomad server that is in the minority of a
@@ -953,13 +1024,9 @@ func (c *Client) updateNodeStatus() error {
 	// has connectivity to the existing majority of Nomad Servers, but
 	// only if it queries Consul.
 	if resp.LeaderRPCAddr == "" {
-		atomic.CompareAndSwapInt32(&c.lastHeartbeatFromQuorum, 1, 0)
-		return nil
+		c.triggerDiscovery()
 	}
 
-	const heartbeatFallbackFactor = 3
-	atomic.CompareAndSwapInt32(&c.lastHeartbeatFromQuorum, 0, 1)
-	c.consulPullHeartbeatDeadline = time.Now().Add(heartbeatFallbackFactor * resp.HeartbeatTTL)
 	return nil
 }
 
@@ -997,7 +1064,11 @@ func (c *Client) allocSync() {
 			// terminal state then start the blocked allocation
 			c.blockedAllocsLock.Lock()
 			if blockedAlloc, ok := c.blockedAllocations[alloc.ID]; ok && alloc.Terminated() {
-				if err := c.addAlloc(blockedAlloc); err != nil {
+				var prevAllocDir *allocdir.AllocDir
+				if ar, ok := c.getAllocRunners()[alloc.ID]; ok {
+					prevAllocDir = ar.GetAllocDir()
+				}
+				if err := c.addAlloc(blockedAlloc, prevAllocDir); err != nil {
 					c.logger.Printf("[ERR] client: failed to add alloc which was previously blocked %q: %v",
 						blockedAlloc.ID, err)
 				}
@@ -1083,9 +1154,20 @@ func (c *Client) watchAllocations(updates chan *allocUpdates) {
 		resp = structs.NodeClientAllocsResponse{}
 		err := c.RPC("Node.GetClientAllocs", &req, &resp)
 		if err != nil {
-			c.logger.Printf("[ERR] client: failed to query for node allocations: %v", err)
+			// Shutdown often causes EOF errors, so check for shutdown first
+			select {
+			case <-c.shutdownCh:
+				return
+			default:
+			}
+
+			if err != noServersErr {
+				c.logger.Printf("[ERR] client: failed to query for node allocations: %v", err)
+			}
 			retry := c.retryIntv(getAllocRetryIntv)
 			select {
+			case <-c.serversDiscoveredCh:
+				continue
 			case <-time.After(retry):
 				continue
 			case <-c.shutdownCh:
@@ -1132,6 +1214,8 @@ func (c *Client) watchAllocations(updates chan *allocUpdates) {
 				c.logger.Printf("[ERR] client: failed to query updated allocations: %v", err)
 				retry := c.retryIntv(getAllocRetryIntv)
 				select {
+				case <-c.serversDiscoveredCh:
+					continue
 				case <-time.After(retry):
 					continue
 				case <-c.shutdownCh:
@@ -1225,13 +1309,26 @@ func (c *Client) runAllocs(update *allocUpdates) {
 			c.logger.Printf("[ERR] client: failed to update alloc '%s': %v",
 				update.exist.ID, err)
 		}
+
+		// See if the updated alloc is getting migrated
+		c.migratingAllocsLock.Lock()
+		ch, ok := c.migratingAllocs[update.updated.ID]
+		c.migratingAllocsLock.Unlock()
+		if ok {
+			// Stopping the migration if the allocation doesn't need any
+			// migration
+			if !update.updated.ShouldMigrate() {
+				close(ch)
+			}
+		}
 	}
 
 	// Start the new allocations
 	for _, add := range diff.added {
-		// If the allocation is chanined and the previous allocation hasn't
+		// If the allocation is chained and the previous allocation hasn't
 		// terminated yet, then add the alloc to the blocked queue.
-		if ar, ok := c.getAllocRunners()[add.PreviousAllocation]; ok && !ar.Alloc().Terminated() {
+		ar, ok := c.getAllocRunners()[add.PreviousAllocation]
+		if ok && !ar.Alloc().Terminated() {
 			c.logger.Printf("[DEBUG] client: added alloc %q to blocked queue", add.ID)
 			c.blockedAllocsLock.Lock()
 			c.blockedAllocations[add.PreviousAllocation] = add
@@ -1239,7 +1336,25 @@ func (c *Client) runAllocs(update *allocUpdates) {
 			continue
 		}
 
-		if err := c.addAlloc(add); err != nil {
+		// This means the allocation has a previous allocation on another node
+		// so we will block for the previous allocation to complete
+		if add.PreviousAllocation != "" && !ok {
+			c.migratingAllocsLock.Lock()
+			c.migratingAllocs[add.ID] = make(chan struct{})
+			c.migratingAllocsLock.Unlock()
+			go c.blockForRemoteAlloc(add)
+			continue
+		}
+
+		// Setting the previous allocdir if the allocation had a terminal
+		// previous allocation
+		var prevAllocDir *allocdir.AllocDir
+		tg := add.Job.LookupTaskGroup(add.TaskGroup)
+		if tg != nil && tg.EphemeralDisk.Sticky == true && ar != nil {
+			prevAllocDir = ar.GetAllocDir()
+		}
+
+		if err := c.addAlloc(add, prevAllocDir); err != nil {
 			c.logger.Printf("[ERR] client: failed to add alloc '%s': %v",
 				add.ID, err)
 		}
@@ -1249,6 +1364,236 @@ func (c *Client) runAllocs(update *allocUpdates) {
 	if err := c.saveState(); err != nil {
 		c.logger.Printf("[ERR] client: failed to save state: %v", err)
 	}
+}
+
+// blockForRemoteAlloc blocks until the previous allocation of an allocation has
+// been terminated and migrates the snapshot data
+func (c *Client) blockForRemoteAlloc(alloc *structs.Allocation) {
+	c.logger.Printf("[DEBUG] client: blocking alloc %q for previous allocation %q", alloc.ID, alloc.PreviousAllocation)
+
+	// Removing the allocation from the set of allocs which are currently
+	// undergoing migration
+	defer func() {
+		c.migratingAllocsLock.Lock()
+		delete(c.migratingAllocs, alloc.ID)
+		c.migratingAllocsLock.Unlock()
+	}()
+
+	// Block until the previous allocation migrates to terminal state
+	prevAlloc, err := c.waitForAllocTerminal(alloc.PreviousAllocation)
+	if err != nil {
+		c.logger.Printf("[ERR] client: error waiting for allocation %q: %v", alloc.PreviousAllocation, err)
+	}
+
+	// Migrate the data from the remote node
+	prevAllocDir, err := c.migrateRemoteAllocDir(prevAlloc, alloc.ID)
+	if err != nil {
+		c.logger.Printf("[ERR] client: error migrating data from remote alloc %q: %v", alloc.PreviousAllocation, err)
+	}
+
+	// Add the allocation
+	if err := c.addAlloc(alloc, prevAllocDir); err != nil {
+		c.logger.Printf("[ERR] client: error adding alloc: %v", err)
+	}
+}
+
+// waitForAllocTerminal waits for an allocation with the given alloc id to
+// transition to terminal state and blocks the caller until then.
+func (c *Client) waitForAllocTerminal(allocID string) (*structs.Allocation, error) {
+	req := structs.AllocSpecificRequest{
+		AllocID: allocID,
+		QueryOptions: structs.QueryOptions{
+			Region:     c.Region(),
+			AllowStale: true,
+		},
+	}
+
+	for {
+		resp := structs.SingleAllocResponse{}
+		err := c.RPC("Alloc.GetAlloc", &req, &resp)
+		if err != nil {
+			c.logger.Printf("[ERR] client: failed to query allocation %q: %v", allocID, err)
+			retry := c.retryIntv(getAllocRetryIntv)
+			select {
+			case <-time.After(retry):
+				continue
+			case <-c.shutdownCh:
+				return nil, fmt.Errorf("aborting because client is shutting down")
+			}
+		}
+		if resp.Alloc == nil {
+			return nil, nil
+		}
+		if resp.Alloc.Terminated() {
+			return resp.Alloc, nil
+		}
+
+		// Update the query index.
+		if resp.Index > req.MinQueryIndex {
+			req.MinQueryIndex = resp.Index
+		}
+
+	}
+}
+
+// migrateRemoteAllocDir migrates the allocation directory from a remote node to
+// the current node
+func (c *Client) migrateRemoteAllocDir(alloc *structs.Allocation, allocID string) (*allocdir.AllocDir, error) {
+	if alloc == nil {
+		return nil, nil
+	}
+
+	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
+	if tg == nil {
+		return nil, fmt.Errorf("Task Group %q not found in job %q", tg.Name, alloc.Job.ID)
+	}
+
+	// Skip migration of data if the ephemeral disk is not sticky or
+	// migration is turned off.
+	if !tg.EphemeralDisk.Sticky || !tg.EphemeralDisk.Migrate {
+		return nil, nil
+	}
+
+	node, err := c.getNode(alloc.NodeID)
+
+	// If the node is down then skip migrating the data
+	if err != nil {
+		return nil, fmt.Errorf("error retreiving node %v: %v", alloc.NodeID, err)
+	}
+
+	// Check if node is nil
+	if node == nil {
+		return nil, fmt.Errorf("node %q doesn't exist", alloc.NodeID)
+	}
+
+	// skip migration if the remote node is down
+	if node.Status == structs.NodeStatusDown {
+		c.logger.Printf("[INFO] client: not migrating data from alloc %q since node %q is down", alloc.ID, alloc.NodeID)
+		return nil, nil
+	}
+
+	// Create the previous alloc dir
+	pathToAllocDir := filepath.Join(c.config.AllocDir, alloc.ID)
+	if err := os.MkdirAll(pathToAllocDir, 0777); err != nil {
+		c.logger.Printf("[ERR] client: error creating previous allocation dir: %v", err)
+	}
+
+	// Get the snapshot
+	url := fmt.Sprintf("http://%v/v1/client/allocation/%v/snapshot", node.HTTPAddr, alloc.ID)
+	resp, err := http.Get(url)
+	if err != nil {
+		os.RemoveAll(pathToAllocDir)
+		c.logger.Printf("[ERR] client: error getting snapshot: %v", err)
+		return nil, fmt.Errorf("error getting snapshot for alloc %v: %v", alloc.ID, err)
+	}
+	tr := tar.NewReader(resp.Body)
+	defer resp.Body.Close()
+
+	buf := make([]byte, 1024)
+
+	stopMigrating, ok := c.migratingAllocs[allocID]
+	if !ok {
+		os.RemoveAll(pathToAllocDir)
+		return nil, fmt.Errorf("couldn't find a migration validity notifier for alloc: %v", alloc.ID)
+	}
+	for {
+		// See if the alloc still needs migration
+		select {
+		case <-stopMigrating:
+			os.RemoveAll(pathToAllocDir)
+			c.logger.Printf("[INFO] client: stopping migration of allocdir for alloc: %v", alloc.ID)
+			return nil, nil
+		case <-c.shutdownCh:
+			os.RemoveAll(pathToAllocDir)
+			c.logger.Printf("[INFO] client: stopping migration of alloc %q since client is shutting down", alloc.ID)
+			return nil, nil
+		default:
+		}
+
+		// Get the next header
+		hdr, err := tr.Next()
+
+		// If the snapshot has ended then we create the previous
+		// allocdir
+		if err == io.EOF {
+			prevAllocDir := allocdir.NewAllocDir(pathToAllocDir, 0)
+			return prevAllocDir, nil
+		}
+		// If there is an error then we avoid creating the alloc dir
+		if err != nil {
+			os.RemoveAll(pathToAllocDir)
+			return nil, fmt.Errorf("error creating alloc dir for alloc %q: %v", alloc.ID, err)
+		}
+
+		// If the header is for a directory we create the directory
+		if hdr.Typeflag == tar.TypeDir {
+			os.MkdirAll(filepath.Join(pathToAllocDir, hdr.Name), 0777)
+			continue
+		}
+		// If the header is a file, we write to a file
+		if hdr.Typeflag == tar.TypeReg {
+			f, err := os.Create(filepath.Join(pathToAllocDir, hdr.Name))
+			if err != nil {
+				c.logger.Printf("[ERR] client: error creating file: %v", err)
+				continue
+			}
+
+			// We write in chunks of 32 bytes so that we can test if
+			// the client is still alive
+			for {
+				if c.shutdown {
+					f.Close()
+					os.RemoveAll(pathToAllocDir)
+					c.logger.Printf("[INFO] client: stopping migration of alloc %q because client is shutting down", alloc.ID)
+					return nil, nil
+				}
+
+				n, err := tr.Read(buf)
+				if err != nil {
+					f.Close()
+					if err != io.EOF {
+						return nil, fmt.Errorf("error reading snapshot: %v", err)
+					}
+					break
+				}
+				if _, err := f.Write(buf[:n]); err != nil {
+					f.Close()
+					os.RemoveAll(pathToAllocDir)
+					return nil, fmt.Errorf("error writing to file %q: %v", f.Name(), err)
+				}
+			}
+
+		}
+	}
+}
+
+// getNode gets the node from the server with the given Node ID
+func (c *Client) getNode(nodeID string) (*structs.Node, error) {
+	req := structs.NodeSpecificRequest{
+		NodeID: nodeID,
+		QueryOptions: structs.QueryOptions{
+			Region:     c.Region(),
+			AllowStale: true,
+		},
+	}
+
+	resp := structs.SingleNodeResponse{}
+	for {
+		err := c.RPC("Node.GetNode", &req, &resp)
+		if err != nil {
+			c.logger.Printf("[ERR] client: failed to query node info %q: %v", nodeID, err)
+			retry := c.retryIntv(getAllocRetryIntv)
+			select {
+			case <-time.After(retry):
+				continue
+			case <-c.shutdownCh:
+				return nil, fmt.Errorf("aborting because client is shutting down")
+			}
+		}
+		break
+	}
+
+	return resp.Node, nil
 }
 
 // removeAlloc is invoked when we should remove an allocation
@@ -1282,9 +1627,10 @@ func (c *Client) updateAlloc(exist, update *structs.Allocation) error {
 }
 
 // addAlloc is invoked when we should add an allocation
-func (c *Client) addAlloc(alloc *structs.Allocation) error {
+func (c *Client) addAlloc(alloc *structs.Allocation, prevAllocDir *allocdir.AllocDir) error {
 	c.configLock.RLock()
-	ar := NewAllocRunner(c.logger, c.configCopy, c.updateAllocStatus, alloc)
+	ar := NewAllocRunner(c.logger, c.configCopy, c.updateAllocStatus, alloc, c.vaultClient)
+	ar.SetPreviousAllocDir(prevAllocDir)
 	c.configLock.RUnlock()
 	go ar.Run()
 
@@ -1298,14 +1644,6 @@ func (c *Client) addAlloc(alloc *structs.Allocation) error {
 // setupVaultClient creates an object to periodically renew tokens and secrets
 // with vault.
 func (c *Client) setupVaultClient() error {
-	if c.config.VaultConfig == nil {
-		return fmt.Errorf("nil vault config")
-	}
-
-	if !c.config.VaultConfig.Enabled {
-		return nil
-	}
-
 	var err error
 	if c.vaultClient, err =
 		vaultclient.NewVaultClient(c.config.VaultConfig, c.logger, c.deriveToken); err != nil {
@@ -1316,6 +1654,9 @@ func (c *Client) setupVaultClient() error {
 		c.logger.Printf("[ERR] client: failed to create vault client")
 		return fmt.Errorf("failed to create vault client")
 	}
+
+	// Start renewing tokens and secrets
+	c.vaultClient.Start()
 
 	return nil
 }
@@ -1405,169 +1746,182 @@ func (c *Client) deriveToken(alloc *structs.Allocation, taskNames []string, vcli
 	return unwrappedTokens, nil
 }
 
-// setupConsulSyncer creates Client-mode consul.Syncer which periodically
-// executes callbacks on a fixed interval.
-//
-// TODO(sean@): this could eventually be moved to a priority queue and give
-// each task an interval, but that is not necessary at this time.
-func (c *Client) setupConsulSyncer() error {
-	// The bootstrapFn callback handler is used to periodically poll
-	// Consul to look up the Nomad Servers in Consul.  In the event the
-	// heartbeat deadline has been exceeded and this Client is orphaned
-	// from its servers, periodically poll Consul to reattach this Client
-	// to its cluster and automatically recover from a detached state.
-	bootstrapFn := func() error {
-		now := time.Now()
-		c.heartbeatLock.Lock()
+// triggerDiscovery causes a Consul discovery to begin (if one hasn't alread)
+func (c *Client) triggerDiscovery() {
+	select {
+	case c.triggerDiscoveryCh <- struct{}{}:
+		// Discovery goroutine was released to execute
+	default:
+		// Discovery goroutine was already running
+	}
+}
 
-		// If the last heartbeat didn't contain a leader, give the
-		// Nomad server this Agent is talking to one more attempt at
-		// providing a heartbeat that does contain a leader.
-		if atomic.LoadInt32(&c.lastHeartbeatFromQuorum) == 1 && now.Before(c.consulPullHeartbeatDeadline) {
-			c.heartbeatLock.Unlock()
-			return nil
-		}
-		c.heartbeatLock.Unlock()
-
-		consulCatalog := c.consulSyncer.ConsulClient().Catalog()
-		dcs, err := consulCatalog.Datacenters()
-		if err != nil {
-			return fmt.Errorf("client.consul: unable to query Consul datacenters: %v", err)
-		}
-		if len(dcs) > 2 {
-			// Query the local DC first, then shuffle the
-			// remaining DCs.  Future heartbeats will cause Nomad
-			// Clients to fixate on their local datacenter so
-			// it's okay to talk with remote DCs.  If the no
-			// Nomad servers are available within
-			// datacenterQueryLimit, the next heartbeat will pick
-			// a new set of servers so it's okay.
-			shuffleStrings(dcs[1:])
-			dcs = dcs[0:lib.MinInt(len(dcs), datacenterQueryLimit)]
-		}
-
-		// Forward RPCs to our region
-		nomadRPCArgs := structs.GenericRequest{
-			QueryOptions: structs.QueryOptions{
-				Region: c.Region(),
-			},
-		}
-
-		nomadServerServiceName := c.config.ConsulConfig.ServerServiceName
-		var mErr multierror.Error
-		const defaultMaxNumNomadServers = 8
-		nomadServerServices := make([]string, 0, defaultMaxNumNomadServers)
-		c.logger.Printf("[DEBUG] client.consul: bootstrap contacting following Consul DCs: %+q", dcs)
-		for _, dc := range dcs {
-			consulOpts := &consulapi.QueryOptions{
-				AllowStale: true,
-				Datacenter: dc,
-				Near:       "_agent",
-				WaitTime:   consul.DefaultQueryWaitDuration,
+// consulDiscovery waits for the signal to attempt server discovery via Consul.
+// It's intended to be started in a goroutine. See triggerDiscovery() for
+// causing consul discovery from other code locations.
+func (c *Client) consulDiscovery() {
+	for {
+		select {
+		case <-c.triggerDiscoveryCh:
+			if err := c.consulDiscoveryImpl(); err != nil {
+				c.logger.Printf("[ERR] client.consul: error discovering nomad servers: %v", err)
 			}
-			consulServices, _, err := consulCatalog.Service(nomadServerServiceName, consul.ServiceTagRPC, consulOpts)
+		case <-c.shutdownCh:
+			return
+		}
+	}
+}
+
+func (c *Client) consulDiscoveryImpl() error {
+	// Acquire heartbeat lock to prevent heartbeat from running
+	// concurrently with discovery. Concurrent execution is safe, however
+	// discovery is usually triggered when heartbeating has failed so
+	// there's no point in allowing it.
+	c.heartbeatLock.Lock()
+	defer c.heartbeatLock.Unlock()
+
+	consulCatalog := c.consulSyncer.ConsulClient().Catalog()
+	dcs, err := consulCatalog.Datacenters()
+	if err != nil {
+		return fmt.Errorf("client.consul: unable to query Consul datacenters: %v", err)
+	}
+	if len(dcs) > 2 {
+		// Query the local DC first, then shuffle the
+		// remaining DCs.  Future heartbeats will cause Nomad
+		// Clients to fixate on their local datacenter so
+		// it's okay to talk with remote DCs.  If the no
+		// Nomad servers are available within
+		// datacenterQueryLimit, the next heartbeat will pick
+		// a new set of servers so it's okay.
+		shuffleStrings(dcs[1:])
+		dcs = dcs[0:lib.MinInt(len(dcs), datacenterQueryLimit)]
+	}
+
+	// Query for servers in this client's region only
+	region := c.Region()
+	rpcargs := structs.GenericRequest{
+		QueryOptions: structs.QueryOptions{
+			Region: region,
+		},
+	}
+
+	serviceName := c.configCopy.ConsulConfig.ServerServiceName
+	var mErr multierror.Error
+	var servers endpoints
+	c.logger.Printf("[DEBUG] client.consul: bootstrap contacting following Consul DCs: %+q", dcs)
+DISCOLOOP:
+	for _, dc := range dcs {
+		consulOpts := &consulapi.QueryOptions{
+			AllowStale: true,
+			Datacenter: dc,
+			Near:       "_agent",
+			WaitTime:   consul.DefaultQueryWaitDuration,
+		}
+		consulServices, _, err := consulCatalog.Service(serviceName, consul.ServiceTagRPC, consulOpts)
+		if err != nil {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("unable to query service %+q from Consul datacenter %+q: %v", serviceName, dc, err))
+			continue
+		}
+
+		for _, s := range consulServices {
+			port := strconv.Itoa(s.ServicePort)
+			addrstr := s.ServiceAddress
+			if addrstr == "" {
+				addrstr = s.Address
+			}
+			addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(addrstr, port))
 			if err != nil {
-				mErr.Errors = append(mErr.Errors, fmt.Errorf("unable to query service %+q from Consul datacenter %+q: %v", nomadServerServiceName, dc, err))
+				mErr.Errors = append(mErr.Errors, err)
+				continue
+			}
+			var peers []string
+			if err := c.connPool.RPC(region, addr, c.RPCMajorVersion(), "Status.Peers", rpcargs, &peers); err != nil {
+				mErr.Errors = append(mErr.Errors, err)
 				continue
 			}
 
-			for _, s := range consulServices {
-				port := strconv.FormatInt(int64(s.ServicePort), 10)
-				addr := s.ServiceAddress
-				if addr == "" {
-					addr = s.Address
-				}
-				serverAddr := net.JoinHostPort(addr, port)
-				serverEndpoint, err := rpcproxy.NewServerEndpoint(serverAddr)
+			// Successfully received the Server peers list of the correct
+			// region
+			for _, p := range peers {
+				addr, err := net.ResolveTCPAddr("tcp", p)
 				if err != nil {
 					mErr.Errors = append(mErr.Errors, err)
-					continue
 				}
-				var peers []string
-				if err := c.connPool.RPC(c.Region(), serverEndpoint.Addr, c.RPCMajorVersion(), "Status.Peers", nomadRPCArgs, &peers); err != nil {
-					mErr.Errors = append(mErr.Errors, err)
-					continue
-				}
-				// Successfully received the Server peers list of the correct
-				// region
-				if len(peers) != 0 {
-					nomadServerServices = append(nomadServerServices, peers...)
-					break
-				}
+				servers = append(servers, &endpoint{name: p, addr: addr})
 			}
-			// Break if at least one Nomad Server was successfully pinged
-			if len(nomadServerServices) > 0 {
-				break
+			if len(servers) > 0 {
+				break DISCOLOOP
 			}
 		}
-		if len(nomadServerServices) == 0 {
-			if len(mErr.Errors) > 0 {
-				return mErr.ErrorOrNil()
-			}
-
-			return fmt.Errorf("no Nomad Servers advertising service %q in Consul datacenters: %q", nomadServerServiceName, dcs)
-		}
-
-		// Log the servers we are adding
-		c.logger.Printf("[DEBUG] client.consul: bootstrap adding following Servers: %q", nomadServerServices)
-
-		c.heartbeatLock.Lock()
-		if atomic.LoadInt32(&c.lastHeartbeatFromQuorum) == 1 && now.Before(c.consulPullHeartbeatDeadline) {
-			c.heartbeatLock.Unlock()
-			// Common, healthy path
-			if err := c.rpcProxy.SetBackupServers(nomadServerServices); err != nil {
-				return fmt.Errorf("client.consul: unable to set backup servers: %v", err)
-			}
-		} else {
-			c.heartbeatLock.Unlock()
-			// If this Client is talking with a Server that
-			// doesn't have a leader, and we have exceeded the
-			// consulPullHeartbeatDeadline, change the call from
-			// SetBackupServers() to calling AddPrimaryServer()
-			// in order to allow the Clients to randomly begin
-			// considering all known Nomad servers and
-			// eventually, hopefully, find their way to a Nomad
-			// Server that has quorum (assuming Consul has a
-			// server list that is in the majority).
-			for _, s := range nomadServerServices {
-				c.rpcProxy.AddPrimaryServer(s)
-			}
-		}
-
-		return nil
 	}
-	if c.config.ConsulConfig.ClientAutoJoin {
-		c.consulSyncer.AddPeriodicHandler("Nomad Client Fallback Server Handler", bootstrapFn)
+	if len(servers) == 0 {
+		if len(mErr.Errors) > 0 {
+			return mErr.ErrorOrNil()
+		}
+		return fmt.Errorf("no Nomad Servers advertising service %q in Consul datacenters: %+q", serviceName, dcs)
 	}
 
-	consulServicesReaperFn := func() error {
-		const estInitialExecutorDomains = 8
+	c.logger.Printf("[INFO] client.consul: discovered following Servers: %s", servers)
+	c.servers.set(servers)
 
-		// Create the domains to keep and add the server and client
-		domains := make([]consul.ServiceDomain, 2, estInitialExecutorDomains)
-		domains[0] = consul.ServerDomain
-		domains[1] = consul.ClientDomain
+	// Notify waiting rpc calls. If a goroutine just failed an RPC call and
+	// isn't receiving on this chan yet they'll still retry eventually.
+	// This is a shortcircuit for the longer retry intervals.
+	for {
+		select {
+		case c.serversDiscoveredCh <- struct{}{}:
+		default:
+			return nil
+		}
+	}
+}
 
-		for allocID, ar := range c.getAllocRunners() {
-			ar.taskStatusLock.RLock()
-			taskStates := copyTaskStates(ar.taskStates)
-			ar.taskStatusLock.RUnlock()
-			for taskName, taskState := range taskStates {
-				// Only keep running tasks
-				if taskState.State == structs.TaskStateRunning {
-					d := consul.NewExecutorDomain(allocID, taskName)
-					domains = append(domains, d)
+// consulReaper periodically reaps unmatched domains from Consul. Intended to
+// be called in its own goroutine. See consulReaperIntv for interval.
+func (c *Client) consulReaper() {
+	ticker := time.NewTicker(consulReaperIntv)
+	defer ticker.Stop()
+	lastok := true
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.consulReaperImpl(); err != nil {
+				if lastok {
+					c.logger.Printf("[ERR] consul.client: error reaping services in consul: %v", err)
+					lastok = false
 				}
+			} else {
+				lastok = true
+			}
+		case <-c.shutdownCh:
+			return
+		}
+	}
+}
+
+// consulReaperImpl reaps unmatched domains from Consul.
+func (c *Client) consulReaperImpl() error {
+	const estInitialExecutorDomains = 8
+
+	// Create the domains to keep and add the server and client
+	domains := make([]consul.ServiceDomain, 2, estInitialExecutorDomains)
+	domains[0] = consul.ServerDomain
+	domains[1] = consul.ClientDomain
+
+	for allocID, ar := range c.getAllocRunners() {
+		ar.taskStatusLock.RLock()
+		taskStates := copyTaskStates(ar.taskStates)
+		ar.taskStatusLock.RUnlock()
+		for taskName, taskState := range taskStates {
+			// Only keep running tasks
+			if taskState.State == structs.TaskStateRunning {
+				d := consul.NewExecutorDomain(allocID, taskName)
+				domains = append(domains, d)
 			}
 		}
-
-		return c.consulSyncer.ReapUnmatched(domains)
-	}
-	if c.config.ConsulConfig.AutoAdvertise {
-		c.consulSyncer.AddPeriodicHandler("Nomad Client Services Sync Handler", consulServicesReaperFn)
 	}
 
-	return nil
+	return c.consulSyncer.ReapUnmatched(domains)
 }
 
 // collectHostStats collects host resource usage stats periodically
@@ -1626,7 +1980,18 @@ func (c *Client) emitStats(hStats *stats.HostStats) {
 	}
 }
 
-// RPCProxy returns the Client's RPCProxy instance
-func (c *Client) RPCProxy() *rpcproxy.RPCProxy {
-	return c.rpcProxy
+// resolveServer given a sever's address as a string, return it's resolved
+// net.Addr or an error.
+func resolveServer(s string) (net.Addr, error) {
+	const defaultClientPort = "4647" // default client RPC port
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		if strings.Contains(err.Error(), "missing port") {
+			host = s
+			port = defaultClientPort
+		} else {
+			return nil, err
+		}
+	}
+	return net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
 }

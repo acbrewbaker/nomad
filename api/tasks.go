@@ -82,10 +82,11 @@ type Service struct {
 	Checks    []ServiceCheck
 }
 
-// LocalDisk is an ephemeral disk object
-type LocalDisk struct {
-	Sticky bool
-	DiskMB int `mapstructure:"disk"`
+// EphemeralDisk is an ephemeral disk object
+type EphemeralDisk struct {
+	Sticky  bool
+	Migrate bool
+	SizeMB  int `mapstructure:"size"`
 }
 
 // TaskGroup is the unit of scheduling.
@@ -95,7 +96,7 @@ type TaskGroup struct {
 	Constraints   []*Constraint
 	Tasks         []*Task
 	RestartPolicy *RestartPolicy
-	LocalDisk     *LocalDisk
+	EphemeralDisk *EphemeralDisk
 	Meta          map[string]string
 }
 
@@ -128,9 +129,9 @@ func (g *TaskGroup) AddTask(t *Task) *TaskGroup {
 	return g
 }
 
-// RequireDisk adds a local disk to the task group
-func (g *TaskGroup) RequireDisk(disk *LocalDisk) *TaskGroup {
-	g.LocalDisk = disk
+// RequireDisk adds a ephemeral disk to the task group
+func (g *TaskGroup) RequireDisk(disk *EphemeralDisk) *TaskGroup {
+	g.EphemeralDisk = disk
 	return g
 }
 
@@ -155,6 +156,7 @@ type Task struct {
 	LogConfig   *LogConfig
 	Artifacts   []*TaskArtifact
 	Vault       *Vault
+	Templates   []*Template
 }
 
 // TaskArtifact is used to download artifacts before running a task.
@@ -164,8 +166,19 @@ type TaskArtifact struct {
 	RelativeDest  string
 }
 
+type Template struct {
+	SourcePath   string
+	DestPath     string
+	EmbeddedTmpl string
+	ChangeMode   string
+	ChangeSignal string
+	Splay        time.Duration
+	Once         bool
+}
+
 type Vault struct {
 	Policies []string
+	Env      bool
 }
 
 // NewTask creates and initializes a new Task.
@@ -233,21 +246,32 @@ const (
 	TaskDownloadingArtifacts   = "Downloading Artifacts"
 	TaskArtifactDownloadFailed = "Failed Artifact Download"
 	TaskDiskExceeded           = "Disk Exceeded"
+	TaskVaultRenewalFailed     = "Vault token renewal failed"
+	TaskSiblingFailed          = "Sibling task failed"
+	TaskSignaling              = "Signaling"
+	TaskRestartSignal          = "Restart Signaled"
 )
 
 // TaskEvent is an event that effects the state of a task and contains meta-data
 // appropriate to the events type.
 type TaskEvent struct {
-	Type            string
-	Time            int64
-	RestartReason   string
-	DriverError     string
-	ExitCode        int
-	Signal          int
-	Message         string
-	KillTimeout     time.Duration
-	KillError       string
-	StartDelay      int64
-	DownloadError   string
-	ValidationError string
+	Type             string
+	Time             int64
+	RestartReason    string
+	DriverError      string
+	ExitCode         int
+	Signal           int
+	Message          string
+	KillReason       string
+	KillTimeout      time.Duration
+	KillError        string
+	StartDelay       int64
+	DownloadError    string
+	ValidationError  string
+	DiskLimit        int64
+	DiskSize         int64
+	FailedSibling    string
+	VaultError       string
+	TaskSignalReason string
+	TaskSignal       string
 }

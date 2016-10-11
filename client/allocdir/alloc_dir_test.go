@@ -1,12 +1,18 @@
 package allocdir
 
 import (
+	"archive/tar"
+	"bytes"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
+
+	tomb "gopkg.in/tomb.v1"
 
 	"github.com/hashicorp/nomad/client/testutil"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -224,5 +230,163 @@ func TestAllocDir_MountSharedAlloc(t *testing.T) {
 		if !reflect.DeepEqual(act, exp) {
 			t.Fatalf("Incorrect data read from task dir: want %v; got %v", exp, act)
 		}
+	}
+}
+
+func TestAllocDir_Snapshot(t *testing.T) {
+	tmp, err := ioutil.TempDir("", "AllocDir")
+	if err != nil {
+		t.Fatalf("Couldn't create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	d := NewAllocDir(tmp, structs.DefaultResources().DiskMB)
+	defer d.Destroy()
+
+	tasks := []*structs.Task{t1, t2}
+	if err := d.Build(tasks); err != nil {
+		t.Fatalf("Build(%v) failed: %v", tasks, err)
+	}
+
+	dataDir := filepath.Join(d.SharedDir, "data")
+	taskDir := d.TaskDirs[t1.Name]
+	taskLocal := filepath.Join(taskDir, "local")
+
+	// Write a file to the shared dir.
+	exp := []byte{'f', 'o', 'o'}
+	file := "bar"
+	if err := ioutil.WriteFile(filepath.Join(dataDir, file), exp, 0777); err != nil {
+		t.Fatalf("Couldn't write file to shared directory: %v", err)
+	}
+
+	// Write a file to the task local
+	exp = []byte{'b', 'a', 'r'}
+	file1 := "lol"
+	if err := ioutil.WriteFile(filepath.Join(taskLocal, file1), exp, 0777); err != nil {
+		t.Fatalf("couldn't write to task local directory: %v", err)
+	}
+
+	var b bytes.Buffer
+	if err := d.Snapshot(&b); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	tr := tar.NewReader(&b)
+	var files []string
+	for {
+		hdr, err := tr.Next()
+		if err != nil && err != io.EOF {
+			t.Fatalf("err: %v", err)
+		}
+		if err == io.EOF {
+			break
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			files = append(files, hdr.FileInfo().Name())
+		}
+	}
+
+	if len(files) != 2 {
+		t.Fatalf("bad files: %#v", files)
+	}
+}
+
+func TestAllocDir_Move(t *testing.T) {
+	tmp, err := ioutil.TempDir("", "AllocDir")
+	if err != nil {
+		t.Fatalf("Couldn't create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	// Create two alloc dirs
+	d1 := NewAllocDir(tmp, structs.DefaultResources().DiskMB)
+	defer d1.Destroy()
+
+	d2 := NewAllocDir(tmp, structs.DefaultResources().DiskMB)
+	defer d2.Destroy()
+
+	tasks := []*structs.Task{t1, t2}
+	if err := d1.Build(tasks); err != nil {
+		t.Fatalf("Build(%v) failed: %v", tasks, err)
+	}
+
+	if err := d2.Build(tasks); err != nil {
+		t.Fatalf("Build(%v) failed: %v", tasks, err)
+	}
+
+	dataDir := filepath.Join(d1.SharedDir, "data")
+	taskDir := d1.TaskDirs[t1.Name]
+	taskLocal := filepath.Join(taskDir, "local")
+
+	// Write a file to the shared dir.
+	exp := []byte{'f', 'o', 'o'}
+	file := "bar"
+	if err := ioutil.WriteFile(filepath.Join(dataDir, file), exp, 0777); err != nil {
+		t.Fatalf("Couldn't write file to shared directory: %v", err)
+	}
+
+	// Write a file to the task local
+	exp = []byte{'b', 'a', 'r'}
+	file1 := "lol"
+	if err := ioutil.WriteFile(filepath.Join(taskLocal, file1), exp, 0777); err != nil {
+		t.Fatalf("couldn't write to task local directory: %v", err)
+	}
+
+	// Move the d1 allocdir to d2
+	if err := d2.Move(d1, []*structs.Task{t1, t2}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure the files in d1 are present in d2
+	fi, err := os.Stat(filepath.Join(d2.SharedDir, "data", "bar"))
+	if err != nil || fi == nil {
+		t.Fatalf("data dir was not moved")
+	}
+
+	fi, err = os.Stat(filepath.Join(d2.TaskDirs[t1.Name], "local", "lol"))
+	if err != nil || fi == nil {
+		t.Fatalf("task local dir was not moved")
+	}
+}
+
+func TestAllocDir_EscapeChecking(t *testing.T) {
+	tmp, err := ioutil.TempDir("", "AllocDir")
+	if err != nil {
+		t.Fatalf("Couldn't create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	d := NewAllocDir(tmp, structs.DefaultResources().DiskMB)
+	defer d.Destroy()
+	tasks := []*structs.Task{t1, t2}
+	if err := d.Build(tasks); err != nil {
+		t.Fatalf("Build(%v) failed: %v", tasks, err)
+	}
+
+	// Check that issuing calls that escape the alloc dir returns errors
+	// List
+	if _, err := d.List(".."); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("List of escaping path didn't error: %v", err)
+	}
+
+	// Stat
+	if _, err := d.Stat("../foo"); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("Stat of escaping path didn't error: %v", err)
+	}
+
+	// ReadAt
+	if _, err := d.ReadAt("../foo", 0); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("ReadAt of escaping path didn't error: %v", err)
+	}
+
+	// BlockUntilExists
+	tomb := tomb.Tomb{}
+	if _, err := d.BlockUntilExists("../foo", &tomb); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("BlockUntilExists of escaping path didn't error: %v", err)
+	}
+
+	// ChangeEvents
+	if _, err := d.ChangeEvents("../foo", 0, &tomb); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("ChangeEvents of escaping path didn't error: %v", err)
 	}
 }
